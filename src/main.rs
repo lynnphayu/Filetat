@@ -1,60 +1,55 @@
 use core::time;
 use std::{
     cell::RefCell,
-    clone,
     collections::HashMap,
     fs::File,
     io::{ErrorKind, Read, Write},
     net::{TcpListener, TcpStream},
     sync::{
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
-        Arc, Mutex, RwLock,
+        Arc,
     },
     thread::{self, sleep, JoinHandle},
 };
 
-enum METHOD {
-    GET,
-    POST,
-}
+type Job = Box<dyn FnOnce() + Send>;
 
 struct HTTPRequest {
     tcp_stream: TcpStream,
-    method: Option<METHOD>,
+    method: String,
     path: String,
     query_parameters: Option<Vec<(String, String)>>,
     body: Option<String>,
 }
 
+type HandlerMap = HashMap<String, HashMap<String, fn(HTTPRequest)>>;
+
 struct Server<'a> {
     listener: &'a TcpListener,
-    get_handlers: &'a Arc<RwLock<HashMap<String, fn(HTTPRequest)>>>,
+    get_handlers: HandlerMap,
     thread_pool: Option<ThreadPool>,
 }
 
 struct ThreadPool {
     current: RefCell<usize>,
     workers: Vec<Worker>,
-    senders: Vec<Sender<HTTPRequest>>,
+    senders: Vec<Sender<Job>>,
 }
 
 struct Worker {
-    id: usize,
     join_handle: JoinHandle<()>,
-    status: Arc<Mutex<bool>>,
+    status: Arc<AtomicBool>,
 }
 
 impl ThreadPool {
-    pub fn new(
-        size: usize,
-        get_handlers: &Arc<RwLock<HashMap<String, fn(HTTPRequest)>>>,
-    ) -> ThreadPool {
+    pub fn new(size: usize) -> ThreadPool {
         assert!(size > 0);
         let mut workers: Vec<Worker> = Vec::with_capacity(size);
-        let mut senders: Vec<Sender<HTTPRequest>> = Vec::with_capacity(size);
-        for i in 0..size {
-            let (sender, reveiver) = mpsc::channel();
-            workers.push(Worker::new(i, reveiver, get_handlers));
+        let mut senders: Vec<Sender<Job>> = Vec::with_capacity(size);
+        for _ in 0..size {
+            let (sender, receiver) = mpsc::channel();
+            workers.push(Worker::new(receiver));
             senders.push(sender);
         }
         ThreadPool {
@@ -63,20 +58,21 @@ impl ThreadPool {
             senders: senders,
         }
     }
-    fn execute(&self, request: HTTPRequest) {
+    fn execute<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
         let mut current_index = self.current.clone().into_inner();
         let tx = &self.senders[current_index];
-        let status = self.workers[current_index].status.lock().unwrap();
-        println!("STATUS ___ {}", status);
-        if *status {
-            println!("{} {} {}", request.path, current_index, status);
-            tx.send(request).unwrap();
+        let status = self.workers[current_index].status.load(Ordering::Relaxed);
+        if status {
+            println!("{} {} ", current_index, status);
+            tx.send(Box::new(f)).unwrap();
         } else {
             current_index = current_index + 1;
-            println!("{} {} {}", request.path, current_index, status);
-            self.senders[current_index].send(request).unwrap();
+            println!("{} {} ", current_index, status);
+            self.senders[current_index].send(Box::new(f)).unwrap();
         }
-        drop(status);
         let next_index = current_index + 1;
         if next_index == self.workers.len() {
             self.current.replace(0);
@@ -87,38 +83,19 @@ impl ThreadPool {
 }
 
 impl Worker {
-    fn new(
-        id: usize,
-        rx: Receiver<HTTPRequest>,
-        map: &Arc<RwLock<HashMap<String, fn(HTTPRequest)>>>,
-    ) -> Worker {
-        let cloned_map = map.clone();
-        let status_mutex = Arc::new(Mutex::new(true));
+    fn new(rx: Receiver<Job>) -> Worker {
+        let status_mutex = Arc::new(AtomicBool::new(true));
         let status_mutex_copy = status_mutex.clone();
 
         let join_handle = thread::spawn(move || loop {
-            if let Ok(request) = rx.recv_timeout(time::Duration::from_millis(500)) {
-                let mut status = status_mutex.lock().unwrap();
-                *status = false;
-                drop(status);
-                match cloned_map.read().unwrap().get(&request.path) {
-                    Some(handler) => {
-                        let copied_handler = handler.to_owned();
-                        copied_handler(request);
-                    }
-                    None => {
-                        println!("NOTFOUND");
-                        not_found(request);
-                    }
-                }
-                let mut status = status_mutex.lock().unwrap();
-                *status = true;
-                drop(status);
+            if let Ok(job) = rx.recv_timeout(time::Duration::from_millis(500)) {
+                status_mutex.store(false, Ordering::Relaxed);
+                job();
+                status_mutex.store(true, Ordering::Relaxed)
             }
         });
 
         return Worker {
-            id,
             join_handle,
             status: status_mutex_copy,
         };
@@ -127,25 +104,39 @@ impl Worker {
 
 impl Server<'_> {
     fn get(&mut self, path: &str, handler: fn(HTTPRequest)) {
-        self.get_handlers
-            .write()
-            .unwrap()
-            .insert(String::from(path), handler);
+        let get_map = self.get_handlers.get_mut("GET").unwrap();
+        get_map.insert(String::from(path), handler);
+    }
+
+    fn post(&mut self, path: &str, handler: fn(HTTPRequest)) {
+        let get_map = self.get_handlers.get_mut("POST").unwrap();
+        get_map.insert(String::from(path), handler);
     }
 
     fn listen(&mut self) {
-        let thread_pool = ThreadPool::new(4, self.get_handlers);
+        let thread_pool = ThreadPool::new(4);
         self.thread_pool = Some(thread_pool);
         for stream in self.listener.incoming() {
             match stream {
                 Ok(str) => {
                     let request = prepare_request(str);
-                    self.thread_pool.as_ref().unwrap().execute(request);
+                    let handle = match self
+                        .get_handlers
+                        .get(&request.method)
+                        .unwrap()
+                        .get(&request.path)
+                        .cloned()
+                    {
+                        Some(handle) => handle,
+                        None => not_found,
+                    };
+                    self.thread_pool.as_ref().unwrap().execute(move || {
+                        handle(request);
+                    })
                 }
                 Err(e) => println!("stream is disrupted: {e}"),
             }
         }
-
     }
 }
 
@@ -184,13 +175,27 @@ fn not_found(mut request: HTTPRequest) {
 }
 
 fn main() {
+    let get: HashMap<String, fn(HTTPRequest)> = HashMap::new();
+    let post: HashMap<String, fn(HTTPRequest)> = HashMap::new();
     let mut server = Server {
         listener: &TcpListener::bind("0.0.0.0:8080").unwrap(),
-        get_handlers: &mut Arc::new(RwLock::new(HashMap::new())),
+        get_handlers: HashMap::from([(String::from("GET"), get), (String::from("POST"), post)]),
         thread_pool: None,
     };
     server.get("/profile", get_profile);
+    server.post("/profile", post_profile);
     server.listen();
+}
+
+fn post_profile(mut request: HTTPRequest) {
+    let body = request.body.unwrap().to_owned();
+    println!("{}", body);
+    request
+        .tcp_stream
+        .write(b"HTTP/1.1 200 OK\nContent-type: application/json\r\n\r\n")
+        .unwrap();
+    request.tcp_stream.write(body.as_bytes()).unwrap();
+    request.tcp_stream.flush().unwrap();
 }
 
 fn prepare_request(mut stream: TcpStream) -> HTTPRequest {
@@ -240,15 +245,9 @@ fn construct_request(stream: TcpStream, utf8_arr: &[u8]) -> HTTPRequest {
         })))
     };
 
-    let method = match method {
-        "GET" => Some(METHOD::GET),
-        "POST" => Some(METHOD::POST),
-        &_ => None,
-    };
-
     return HTTPRequest {
         tcp_stream: stream,
-        method,
+        method: String::from(method),
         path,
         query_parameters,
         body,
